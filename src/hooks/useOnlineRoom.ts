@@ -35,6 +35,21 @@ type SignalingTransport = 'websocket' | 'http';
 
 const HTTP_POLL_MS = 220;
 
+export function resolveHttpCursor(currentCursor: number, response: HttpRoomResponse, advanceResponseCursor: boolean) {
+  const messageCursor = Math.max(
+    currentCursor,
+    ...(response.messages ?? [])
+      .map((message) => message.eventId)
+      .filter((eventId): eventId is number => typeof eventId === 'number'),
+  );
+
+  if (advanceResponseCursor && typeof response.cursor === 'number') {
+    return Math.max(messageCursor, response.cursor);
+  }
+
+  return messageCursor;
+}
+
 function getWebSocketUrl() {
   if (import.meta.env.VITE_WS_URL) {
     return import.meta.env.VITE_WS_URL;
@@ -157,12 +172,9 @@ export function useOnlineRoom(hostGame: BattleGame) {
   );
 
   const handleHttpResponse = useCallback(
-    (response: HttpRoomResponse) => {
+    (response: HttpRoomResponse, options: { advanceCursor?: boolean } = {}) => {
       response.messages?.forEach(handleMessage);
-
-      if (typeof response.cursor === 'number') {
-        cursorRef.current = Math.max(cursorRef.current, response.cursor);
-      }
+      cursorRef.current = resolveHttpCursor(cursorRef.current, response, options.advanceCursor ?? true);
     },
     [handleMessage],
   );
@@ -193,7 +205,7 @@ export function useOnlineRoom(hostGame: BattleGame) {
 
           const data = (await response.json()) as HttpRoomResponse;
           if (sessionRef.current === session) {
-            handleHttpResponse(data);
+            handleHttpResponse(data, { advanceCursor: true });
           }
         } catch {
           if (sessionRef.current === session) {
@@ -227,7 +239,7 @@ export function useOnlineRoom(hostGame: BattleGame) {
           return;
         }
 
-        handleHttpResponse(data);
+        handleHttpResponse(data, { advanceCursor: message.type === 'createRoom' || message.type === 'joinRoom' });
 
         const joinedRoom = data.messages?.find((serverMessage) => serverMessage.type === 'roomCreated' || serverMessage.type === 'roomJoined');
         if (joinedRoom?.code) {
