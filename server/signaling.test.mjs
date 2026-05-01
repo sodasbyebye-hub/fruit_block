@@ -48,12 +48,12 @@ describe('signaling server', () => {
     const guest = await openClient(server.port);
 
     try {
-      host.send(JSON.stringify({ type: 'createRoom' }));
+      sendJson(host, { type: 'createRoom' });
       const created = await readMessage(host);
       const peerJoined = readMessage(host);
       const roomJoined = readMessage(guest);
 
-      guest.send(JSON.stringify({ type: 'joinRoom', code: created.code.toLowerCase() }));
+      sendJson(guest, { type: 'joinRoom', code: created.code.toLowerCase() });
 
       await expect(roomJoined).resolves.toMatchObject({
         type: 'roomJoined',
@@ -67,13 +67,153 @@ describe('signaling server', () => {
       host.close();
     }
   });
+
+  it('relays guest input to the host', async () => {
+    const { host, guest, code, close } = await createJoinedRoom();
+
+    try {
+      const relayed = readMessage(host);
+      sendJson(guest, {
+        type: 'relay',
+        code,
+        payload: { type: 'guestInput', action: 'left' },
+      });
+
+      await expect(relayed).resolves.toMatchObject({
+        type: 'relay',
+        payload: { type: 'guestInput', action: 'left' },
+      });
+    } finally {
+      close();
+    }
+  });
+
+  it('relays host snapshots to the guest', async () => {
+    const { host, guest, code, close } = await createJoinedRoom();
+    const snapshot = {
+      status: 'playing',
+      players: [
+        { id: 'p1', name: 'host', score: 1 },
+        { id: 'p2', name: 'guest', score: 2 },
+      ],
+      winner: null,
+    };
+
+    try {
+      const relayed = readMessage(guest);
+      sendJson(host, {
+        type: 'relay',
+        code,
+        payload: { type: 'hostSnapshot', state: snapshot },
+      });
+
+      await expect(relayed).resolves.toMatchObject({
+        type: 'relay',
+        payload: { type: 'hostSnapshot', state: snapshot },
+      });
+    } finally {
+      close();
+    }
+  });
+
+  it('cleans up and notifies the host when a guest disconnects', async () => {
+    const { host, guest, code, close } = await createJoinedRoom();
+    const peerLeft = readMessage(host);
+
+    try {
+      guest.close();
+      await waitForClose(guest);
+
+      await expect(peerLeft).resolves.toMatchObject({ type: 'peerLeft' });
+
+      const error = readMessage(host);
+      sendJson(host, {
+        type: 'relay',
+        code,
+        payload: { type: 'hostSnapshot', state: { status: 'ready', players: [], winner: null } },
+      });
+
+      await expect(error).resolves.toMatchObject({
+        type: 'roomError',
+        message: 'Peer is not connected',
+      });
+    } finally {
+      close();
+    }
+  });
+
+  it('cleans up and notifies the guest when a host disconnects', async () => {
+    const { host, guest, code, close } = await createJoinedRoom();
+    const peerLeft = readMessage(guest);
+
+    try {
+      host.close();
+      await waitForClose(host);
+
+      await expect(peerLeft).resolves.toMatchObject({ type: 'peerLeft' });
+
+      const error = readMessage(guest);
+      sendJson(guest, {
+        type: 'relay',
+        code,
+        payload: { type: 'guestInput', action: 'right' },
+      });
+
+      await expect(error).resolves.toMatchObject({
+        type: 'roomError',
+        message: 'Peer is not connected',
+      });
+    } finally {
+      close();
+    }
+  });
+
+  it('uses PORT when WS_PORT is not set', async () => {
+    const port = await getFreePort();
+    const server = await startSignalingServer({ port, envKey: 'PORT' });
+
+    expect(server.stdout).toContain(`port ${port}`);
+  });
 });
 
-async function startSignalingServer() {
-  const port = await getFreePort();
+async function createJoinedRoom() {
+  const server = await startSignalingServer();
+  const host = await openClient(server.port);
+  const guest = await openClient(server.port);
+
+  sendJson(host, { type: 'createRoom' });
+  const created = await readMessage(host);
+  const peerJoined = readMessage(host);
+  const roomJoined = readMessage(guest);
+
+  sendJson(guest, { type: 'joinRoom', code: created.code });
+
+  await roomJoined;
+  await peerJoined;
+
+  return {
+    host,
+    guest,
+    code: created.code,
+    close() {
+      host.close();
+      guest.close();
+    },
+  };
+}
+
+async function startSignalingServer(options = {}) {
+  const port = options.port ?? (await getFreePort());
+  const env = { ...process.env, WS_HEARTBEAT_MS: '500' };
+  env[options.envKey ?? 'WS_PORT'] = String(port);
+
+  if (options.envKey === 'PORT') {
+    delete env.WS_PORT;
+  }
+
   const child = spawn(process.execPath, ['server/signaling.mjs'], {
     cwd: process.cwd(),
-    env: { ...process.env, WS_PORT: String(port) },
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const server = {
@@ -169,6 +309,10 @@ function openClient(port) {
       reject(error);
     });
   });
+}
+
+function sendJson(socket, message) {
+  socket.send(JSON.stringify(message));
 }
 
 function readMessage(socket) {

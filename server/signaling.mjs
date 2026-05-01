@@ -1,7 +1,8 @@
 import { WebSocketServer } from 'ws';
 import { createRoomStore, normalizeRoomCode } from './rooms.mjs';
 
-const port = Number(process.env.WS_PORT ?? 8787);
+const port = Number(process.env.WS_PORT ?? process.env.PORT ?? 8787);
+const heartbeatMs = Number(process.env.WS_HEARTBEAT_MS ?? 30000);
 const rooms = createRoomStore();
 const wss = new WebSocketServer({ port });
 
@@ -17,7 +18,18 @@ function sendError(client, message) {
   send(client, { type: 'roomError', message });
 }
 
+function leaveRooms(socket) {
+  for (const room of rooms.leave(socket)) {
+    send(room.host === socket ? room.guest : room.host, { type: 'peerLeft' });
+  }
+}
+
 wss.on('connection', (socket) => {
+  socket.isAlive = true;
+  socket.on('pong', () => {
+    socket.isAlive = true;
+  });
+
   socket.on('message', (raw) => {
     let message;
 
@@ -61,17 +73,29 @@ wss.on('connection', (socket) => {
     }
 
     if (message.type === 'leaveRoom') {
-      for (const room of rooms.leave(socket)) {
-        send(room.host === socket ? room.guest : room.host, { type: 'peerLeft' });
-      }
+      leaveRooms(socket);
     }
   });
 
   socket.on('close', () => {
-    for (const room of rooms.leave(socket)) {
-      send(room.host === socket ? room.guest : room.host, { type: 'peerLeft' });
-    }
+    leaveRooms(socket);
   });
 });
 
-console.log(`Jelly Battle signaling server listening on ws://127.0.0.1:${port}`);
+const heartbeat = setInterval(() => {
+  for (const socket of wss.clients) {
+    if (!socket.isAlive) {
+      socket.terminate();
+      continue;
+    }
+
+    socket.isAlive = false;
+    socket.ping();
+  }
+}, heartbeatMs);
+
+wss.on('close', () => {
+  clearInterval(heartbeat);
+});
+
+console.log(`Jelly Battle signaling server listening on port ${port}`);

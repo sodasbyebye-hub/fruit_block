@@ -23,31 +23,10 @@ type ClientMessage =
   | { type: 'createRoom' }
   | { type: 'joinRoom'; code: string }
   | { type: 'relay'; code: string; payload: RelayPayload }
-  | { type: 'leaveRoom'; code: string }
-  | { type: 'poll'; code: string; after: number };
+  | { type: 'leaveRoom'; code: string };
 
-interface HttpRoomResponse {
-  messages?: Array<ServerMessage & { eventId?: number }>;
-  cursor?: number;
-}
-
-type SignalingTransport = 'websocket' | 'http';
-
-const HTTP_POLL_MS = 220;
-
-export function resolveHttpCursor(currentCursor: number, response: HttpRoomResponse, advanceResponseCursor: boolean) {
-  const messageCursor = Math.max(
-    currentCursor,
-    ...(response.messages ?? [])
-      .map((message) => message.eventId)
-      .filter((eventId): eventId is number => typeof eventId === 'number'),
-  );
-
-  if (advanceResponseCursor && typeof response.cursor === 'number') {
-    return Math.max(messageCursor, response.cursor);
-  }
-
-  return messageCursor;
+function isLocalHost(hostname: string) {
+  return ['localhost', '127.0.0.1', '::1'].includes(hostname);
 }
 
 function getWebSocketUrl() {
@@ -55,48 +34,16 @@ function getWebSocketUrl() {
     return import.meta.env.VITE_WS_URL;
   }
 
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.hostname}:8787`;
-}
-
-function getHttpRoomUrl() {
-  return import.meta.env.VITE_SIGNALING_HTTP_URL ?? '/api/rooms';
-}
-
-function getSignalingTransport(): SignalingTransport {
-  const configured = import.meta.env.VITE_SIGNALING_TRANSPORT;
-
-  if (configured === 'http' || configured === 'websocket') {
-    return configured;
+  if (isLocalHost(window.location.hostname)) {
+    return 'ws://127.0.0.1:8787';
   }
 
-  if (import.meta.env.VITE_WS_URL) {
-    return 'websocket';
-  }
-
-  if (['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)) {
-    return 'websocket';
-  }
-
-  return 'http';
-}
-
-function createClientId() {
-  if (crypto.randomUUID) {
-    return crypto.randomUUID();
-  }
-
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return null;
 }
 
 export function useOnlineRoom(hostGame: BattleGame) {
   const socketRef = useRef<WebSocket | null>(null);
-  const transportRef = useRef<SignalingTransport | null>(null);
-  const pollTimerRef = useRef<number | null>(null);
-  const pollInFlightRef = useRef(false);
-  const cursorRef = useRef(0);
   const sessionRef = useRef(0);
-  const clientIdRef = useRef(createClientId());
   const roleRef = useRef<OnlineRole | null>(null);
   const roomCodeRef = useRef('');
   const [role, setRole] = useState<OnlineRole | null>(null);
@@ -106,21 +53,8 @@ export function useOnlineRoom(hostGame: BattleGame) {
   const [copied, setCopied] = useState(false);
   const [remoteState, setRemoteState] = useState<BattleState | null>(null);
 
-  const clearHttpPolling = useCallback(() => {
-    if (pollTimerRef.current) {
-      window.clearInterval(pollTimerRef.current);
-      pollTimerRef.current = null;
-    }
-
-    pollInFlightRef.current = false;
-  }, []);
-
   const handleMessage = useCallback(
-    (message: ServerMessage & { eventId?: number }) => {
-      if (typeof message.eventId === 'number') {
-        cursorRef.current = Math.max(cursorRef.current, message.eventId);
-      }
-
+    (message: ServerMessage) => {
       if (message.type === 'roomCreated' && message.code) {
         roleRef.current = 'host';
         roomCodeRef.current = message.code;
@@ -171,103 +105,11 @@ export function useOnlineRoom(hostGame: BattleGame) {
     [hostGame.controls],
   );
 
-  const handleHttpResponse = useCallback(
-    (response: HttpRoomResponse, options: { advanceCursor?: boolean } = {}) => {
-      response.messages?.forEach(handleMessage);
-      cursorRef.current = resolveHttpCursor(cursorRef.current, response, options.advanceCursor ?? true);
-    },
-    [handleMessage],
-  );
-
-  const startHttpPolling = useCallback(
-    (code: string, session: number) => {
-      clearHttpPolling();
-      cursorRef.current = 0;
-
-      const poll = async () => {
-        if (pollInFlightRef.current || sessionRef.current !== session || transportRef.current !== 'http') {
-          return;
-        }
-
-        pollInFlightRef.current = true;
-
-        try {
-          const response = await fetch(getHttpRoomUrl(), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              type: 'poll',
-              code,
-              after: cursorRef.current,
-              clientId: clientIdRef.current,
-            }),
-          });
-
-          const data = (await response.json()) as HttpRoomResponse;
-          if (sessionRef.current === session) {
-            handleHttpResponse(data, { advanceCursor: true });
-          }
-        } catch {
-          if (sessionRef.current === session) {
-            setStatus('error');
-            setError('Online room service is not available');
-          }
-        } finally {
-          pollInFlightRef.current = false;
-        }
-      };
-
-      pollTimerRef.current = window.setInterval(poll, HTTP_POLL_MS);
-      void poll();
-    },
-    [clearHttpPolling, handleHttpResponse],
-  );
-
-  const sendHttp = useCallback(
-    async (message: ClientMessage) => {
-      const session = sessionRef.current;
-
-      try {
-        const response = await fetch(getHttpRoomUrl(), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...message, clientId: clientIdRef.current }),
-        });
-        const data = (await response.json()) as HttpRoomResponse;
-
-        if (sessionRef.current !== session) {
-          return;
-        }
-
-        handleHttpResponse(data, { advanceCursor: message.type === 'createRoom' || message.type === 'joinRoom' });
-
-        const joinedRoom = data.messages?.find((serverMessage) => serverMessage.type === 'roomCreated' || serverMessage.type === 'roomJoined');
-        if (joinedRoom?.code) {
-          startHttpPolling(joinedRoom.code, session);
-        }
-      } catch {
-        if (sessionRef.current === session) {
-          setStatus('error');
-          setError('Online room service is not available');
-        }
-      }
-    },
-    [handleHttpResponse, startHttpPolling],
-  );
-
-  const send = useCallback(
-    (message: ClientMessage) => {
-      if (transportRef.current === 'websocket' && socketRef.current?.readyState === WebSocket.OPEN) {
-        socketRef.current.send(JSON.stringify(message));
-        return;
-      }
-
-      if (transportRef.current === 'http') {
-        void sendHttp(message);
-      }
-    },
-    [sendHttp],
-  );
+  const send = useCallback((message: ClientMessage) => {
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify(message));
+    }
+  }, []);
 
   const relay = useCallback(
     (payload: RelayPayload) => {
@@ -286,43 +128,58 @@ export function useOnlineRoom(hostGame: BattleGame) {
     }
 
     sessionRef.current += 1;
-    clearHttpPolling();
     socketRef.current?.close();
     socketRef.current = null;
-    transportRef.current = null;
     roleRef.current = null;
     roomCodeRef.current = '';
-    cursorRef.current = 0;
     setRole(null);
     setRoomCode('');
     setStatus('offline');
     setError('');
     setCopied(false);
     setRemoteState(null);
-  }, [clearHttpPolling, send]);
+  }, [send]);
 
   const connectWebSocket = useCallback(
     (onOpen: (socket: WebSocket) => void) => {
       disconnect();
-      sessionRef.current += 1;
-      transportRef.current = 'websocket';
+
+      const url = getWebSocketUrl();
+      if (!url) {
+        setStatus('error');
+        setError('Online battle needs VITE_WS_URL');
+        return;
+      }
+
+      const session = sessionRef.current + 1;
+      sessionRef.current = session;
       setStatus('connecting');
       setError('');
 
-      const socket = new WebSocket(getWebSocketUrl());
+      const socket = new WebSocket(url);
       socketRef.current = socket;
 
-      socket.addEventListener('open', () => onOpen(socket));
+      socket.addEventListener('open', () => {
+        if (sessionRef.current === session) {
+          onOpen(socket);
+        }
+      });
       socket.addEventListener('error', () => {
-        setStatus('error');
-        setError('WebSocket server is not available');
+        if (sessionRef.current === session) {
+          setStatus('error');
+          setError('WebSocket server is not available');
+        }
       });
       socket.addEventListener('close', () => {
-        if (roleRef.current) {
+        if (sessionRef.current === session && roleRef.current) {
           setStatus('offline');
         }
       });
       socket.addEventListener('message', (event) => {
+        if (sessionRef.current !== session) {
+          return;
+        }
+
         try {
           handleMessage(JSON.parse(String(event.data)) as ServerMessage);
         } catch {
@@ -334,38 +191,15 @@ export function useOnlineRoom(hostGame: BattleGame) {
     [disconnect, handleMessage],
   );
 
-  const connectHttp = useCallback(
-    (message: Extract<ClientMessage, { type: 'createRoom' | 'joinRoom' }>) => {
-      disconnect();
-      sessionRef.current += 1;
-      transportRef.current = 'http';
-      cursorRef.current = 0;
-      setStatus('connecting');
-      setError('');
-      void sendHttp(message);
-    },
-    [disconnect, sendHttp],
-  );
-
   const createRoom = useCallback(() => {
-    if (getSignalingTransport() === 'websocket') {
-      connectWebSocket((socket) => socket.send(JSON.stringify({ type: 'createRoom' })));
-      return;
-    }
-
-    connectHttp({ type: 'createRoom' });
-  }, [connectHttp, connectWebSocket]);
+    connectWebSocket((socket) => socket.send(JSON.stringify({ type: 'createRoom' })));
+  }, [connectWebSocket]);
 
   const joinRoom = useCallback(
     (code: string) => {
-      if (getSignalingTransport() === 'websocket') {
-        connectWebSocket((socket) => socket.send(JSON.stringify({ type: 'joinRoom', code })));
-        return;
-      }
-
-      connectHttp({ type: 'joinRoom', code });
+      connectWebSocket((socket) => socket.send(JSON.stringify({ type: 'joinRoom', code })));
     },
-    [connectHttp, connectWebSocket],
+    [connectWebSocket],
   );
 
   const copyInvite = useCallback(async () => {

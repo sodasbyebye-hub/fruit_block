@@ -7,6 +7,7 @@
     "dev": "node server/dev.mjs",
     "dev:client": "vite --host 127.0.0.1",
     "dev:server": "node server/signaling.mjs",
+    "start:server": "node server/signaling.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test": "vitest run"
