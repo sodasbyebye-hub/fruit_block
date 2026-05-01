@@ -255,30 +255,25 @@ function StartMenu({
 }) {
   return (
     <section className="start-menu" aria-label={labels.chooseMode}>
-      <div className="start-hero">
-        <div className="start-jellies" aria-hidden="true">
-          <img alt="" src="/assets/blocks/block-t.png" />
-          <img alt="" src="/assets/blocks/block-o.png" />
-          <img alt="" src="/assets/blocks/block-s.png" />
-        </div>
-        <span className="brand-mark">T</span>
-        <p className="eyebrow">{labels.brand}</p>
-        <h1>{labels.chooseMode}</h1>
-      </div>
+      <img className="start-hero-image" alt="" src="/assets/home/fruit-block-homepage.png" />
+      <div className="start-menu-content">
+        <img className="start-title-image" alt={labels.brand} src="/assets/home/jelly-battle-title.png" />
+        <h1 className="sr-only">{labels.brand}</h1>
 
-      <div className="start-options">
-        <button className="start-option option-solo" type="button" onClick={() => onOpenMode('solo')}>
-          <span>{labels.modeSolo}</span>
-        </button>
-        <button className="start-option option-local" type="button" onClick={() => onOpenMode('local')}>
-          <span>{labels.modeLocal}</span>
-        </button>
-        <button className="start-option option-online" type="button" onClick={() => onOpenMode('online')}>
-          <span>{labels.modeOnline}</span>
-        </button>
-        <button className="start-option option-settings" type="button" onClick={onOpenSettings}>
-          <span>{labels.settings}</span>
-        </button>
+        <div className="start-options">
+          <button className="start-option option-solo" type="button" onClick={() => onOpenMode('solo')}>
+            <span>{labels.modeSolo}</span>
+          </button>
+          <button className="start-option option-local" type="button" onClick={() => onOpenMode('local')}>
+            <span>{labels.modeLocal}</span>
+          </button>
+          <button className="start-option option-online" type="button" onClick={() => onOpenMode('online')}>
+            <span>{labels.modeOnline}</span>
+          </button>
+          <button className="start-option option-settings" type="button" onClick={onOpenSettings}>
+            <span>{labels.settings}</span>
+          </button>
+        </div>
       </div>
     </section>
   );
