@@ -194,6 +194,7 @@ function App() {
             <div className="online-status">
               {statusLabel(online.status, labels)}
               {online.error ? ` · ${online.error === 'Peer disconnected' ? labels.disconnected : online.error}` : ''}
+              {online.latencyMs !== null ? ` · ${online.latencyMs}ms` : ''}
               {online.role === 'guest' ? ` · ${labels.hostOnly}` : ''}
             </div>
             {online.role && (

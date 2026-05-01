@@ -1,135 +1,83 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { PlayerAction } from '../game/types';
+import { type ConnectionStatus, type DataChannelMessage, type OnlineRole } from '../online/onlineProtocol';
+import { createSignalingClient, getOnlineClientId } from '../online/signalingClient';
+import { createWebRtcRoom, type WebRtcRoomConnection } from '../online/webrtcRoom';
 import type { BattleState, PlayerId, useBattleGame } from './useBattleGame';
 
 type BattleGame = ReturnType<typeof useBattleGame>;
-type OnlineRole = 'host' | 'guest';
-type ConnectionStatus = 'offline' | 'connecting' | 'waiting' | 'connected' | 'error';
 
-interface ServerMessage {
-  type: 'roomCreated' | 'roomJoined' | 'peerJoined' | 'peerLeft' | 'roomError' | 'relay';
-  code?: string;
-  role?: OnlineRole;
-  message?: string;
-  payload?: RelayPayload;
-}
-
-type RelayPayload =
-  | { type: 'guestInput'; action: PlayerAction }
-  | { type: 'hostSnapshot'; state: BattleState }
-  | { type: 'hostControl'; control: 'start' | 'pause' | 'resume' | 'reset' };
-
-type ClientMessage =
-  | { type: 'createRoom' }
-  | { type: 'joinRoom'; code: string }
-  | { type: 'relay'; code: string; payload: RelayPayload }
-  | { type: 'leaveRoom'; code: string };
-
-function isLocalHost(hostname: string) {
-  return ['localhost', '127.0.0.1', '::1'].includes(hostname);
-}
-
-function getWebSocketUrl() {
-  if (import.meta.env.VITE_WS_URL) {
-    return import.meta.env.VITE_WS_URL;
-  }
-
-  if (isLocalHost(window.location.hostname)) {
-    return 'ws://127.0.0.1:8787';
-  }
-
-  return null;
-}
+const SNAPSHOT_FRAME_MS = 50;
+const PING_MS = 2000;
 
 export function useOnlineRoom(hostGame: BattleGame) {
-  const socketRef = useRef<WebSocket | null>(null);
-  const sessionRef = useRef(0);
+  const signaling = useMemo(() => createSignalingClient(), []);
+  const clientIdRef = useRef('');
+  const connectionRef = useRef<WebRtcRoomConnection | null>(null);
   const roleRef = useRef<OnlineRole | null>(null);
   const roomCodeRef = useRef('');
+  const latestStateRef = useRef(hostGame.state);
+  const snapshotTimerRef = useRef<number | null>(null);
   const [role, setRole] = useState<OnlineRole | null>(null);
   const [roomCode, setRoomCode] = useState('');
   const [status, setStatus] = useState<ConnectionStatus>('offline');
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
   const [remoteState, setRemoteState] = useState<BattleState | null>(null);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
 
-  const handleMessage = useCallback(
-    (message: ServerMessage) => {
-      if (message.type === 'roomCreated' && message.code) {
-        roleRef.current = 'host';
-        roomCodeRef.current = message.code;
-        setRole('host');
-        setRoomCode(message.code);
-        setStatus('waiting');
-        return;
-      }
+  if (!clientIdRef.current && typeof window !== 'undefined') {
+    clientIdRef.current = getOnlineClientId();
+  }
 
-      if (message.type === 'roomJoined' && message.code) {
-        roleRef.current = 'guest';
-        roomCodeRef.current = message.code;
-        setRole('guest');
-        setRoomCode(message.code);
-        setStatus('connected');
-        return;
-      }
+  latestStateRef.current = hostGame.state;
 
-      if (message.type === 'peerJoined') {
-        setStatus('connected');
-        return;
-      }
-
-      if (message.type === 'peerLeft') {
-        setStatus('waiting');
-        setError('Peer disconnected');
-        return;
-      }
-
-      if (message.type === 'roomError') {
-        setStatus('error');
-        setError(message.message ?? 'Room error');
-        return;
-      }
-
-      if (message.type === 'relay' && message.payload) {
-        const payload = message.payload;
-
-        if (roleRef.current === 'host' && payload.type === 'guestInput') {
-          hostGame.controls.dispatch('p2', payload.action);
-        }
-
-        if (roleRef.current === 'guest' && payload.type === 'hostSnapshot') {
-          setRemoteState(payload.state);
-        }
-      }
-    },
-    [hostGame.controls],
-  );
-
-  const send = useCallback((message: ClientMessage) => {
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify(message));
-    }
+  const sendChannelMessage = useCallback((message: DataChannelMessage) => {
+    return connectionRef.current?.send(message) ?? false;
   }, []);
 
-  const relay = useCallback(
-    (payload: RelayPayload) => {
-      if (!roomCodeRef.current) {
+  const scheduleSnapshot = useCallback(() => {
+    if (roleRef.current !== 'host' || status !== 'connected') {
+      return;
+    }
+
+    if (snapshotTimerRef.current !== null) {
+      return;
+    }
+
+    snapshotTimerRef.current = window.setTimeout(() => {
+      snapshotTimerRef.current = null;
+      sendChannelMessage({ type: 'hostSnapshot', state: latestStateRef.current });
+    }, SNAPSHOT_FRAME_MS);
+  }, [sendChannelMessage, status]);
+
+  const handleChannelMessage = useCallback(
+    (message: DataChannelMessage) => {
+      if (message.type === 'guestInput' && roleRef.current === 'host') {
+        hostGame.controls.dispatch('p2', message.action);
         return;
       }
 
-      send({ type: 'relay', code: roomCodeRef.current, payload });
+      if (message.type === 'hostSnapshot' && roleRef.current === 'guest') {
+        setRemoteState(message.state);
+        return;
+      }
+
+      if (message.type === 'ping') {
+        sendChannelMessage({ type: 'pong', id: message.id, sentAt: message.sentAt });
+        return;
+      }
+
+      if (message.type === 'pong') {
+        setLatencyMs(Math.max(0, Math.round(performance.now() - message.sentAt)));
+      }
     },
-    [send],
+    [hostGame.controls, sendChannelMessage],
   );
 
   const disconnect = useCallback(() => {
-    if (roomCodeRef.current) {
-      send({ type: 'leaveRoom', code: roomCodeRef.current });
-    }
-
-    sessionRef.current += 1;
-    socketRef.current?.close();
-    socketRef.current = null;
+    connectionRef.current?.close();
+    connectionRef.current = null;
     roleRef.current = null;
     roomCodeRef.current = '';
     setRole(null);
@@ -138,68 +86,93 @@ export function useOnlineRoom(hostGame: BattleGame) {
     setError('');
     setCopied(false);
     setRemoteState(null);
-  }, [send]);
+    setLatencyMs(null);
 
-  const connectWebSocket = useCallback(
-    (onOpen: (socket: WebSocket) => void) => {
-      disconnect();
+    if (snapshotTimerRef.current !== null) {
+      window.clearTimeout(snapshotTimerRef.current);
+      snapshotTimerRef.current = null;
+    }
+  }, []);
 
-      const url = getWebSocketUrl();
-      if (!url) {
-        setStatus('error');
-        setError('Online battle needs VITE_WS_URL');
-        return;
-      }
-
-      const session = sessionRef.current + 1;
-      sessionRef.current = session;
-      setStatus('connecting');
+  const openConnection = useCallback(
+    (nextRole: OnlineRole, code: string, cursor: number) => {
+      connectionRef.current?.close();
+      roleRef.current = nextRole;
+      roomCodeRef.current = code;
+      setRole(nextRole);
+      setRoomCode(code);
+      setStatus(nextRole === 'host' ? 'waiting' : 'connecting');
       setError('');
+      setRemoteState(nextRole === 'host' ? latestStateRef.current : null);
+      setLatencyMs(null);
 
-      const socket = new WebSocket(url);
-      socketRef.current = socket;
-
-      socket.addEventListener('open', () => {
-        if (sessionRef.current === session) {
-          onOpen(socket);
-        }
-      });
-      socket.addEventListener('error', () => {
-        if (sessionRef.current === session) {
+      connectionRef.current = createWebRtcRoom({
+        role: nextRole,
+        code,
+        clientId: clientIdRef.current,
+        cursor,
+        signaling,
+        onConnected: () => {
+          setStatus('connected');
+          if (nextRole === 'host') {
+            sendChannelMessage({ type: 'hostSnapshot', state: latestStateRef.current });
+          }
+        },
+        onMessage: handleChannelMessage,
+        onPeerJoined: () => {
+          setStatus('connecting');
+        },
+        onPeerLeft: () => {
+          setStatus(nextRole === 'host' ? 'waiting' : 'offline');
+          setError('Peer disconnected');
+          setLatencyMs(null);
+        },
+        onError: (message) => {
           setStatus('error');
-          setError('WebSocket server is not available');
-        }
-      });
-      socket.addEventListener('close', () => {
-        if (sessionRef.current === session && roleRef.current) {
-          setStatus('offline');
-        }
-      });
-      socket.addEventListener('message', (event) => {
-        if (sessionRef.current !== session) {
-          return;
-        }
-
-        try {
-          handleMessage(JSON.parse(String(event.data)) as ServerMessage);
-        } catch {
-          setStatus('error');
-          setError('Invalid room message');
-        }
+          setError(message);
+        },
       });
     },
-    [disconnect, handleMessage],
+    [handleChannelMessage, sendChannelMessage, signaling],
   );
 
-  const createRoom = useCallback(() => {
-    connectWebSocket((socket) => socket.send(JSON.stringify({ type: 'createRoom' })));
-  }, [connectWebSocket]);
+  const createRoom = useCallback(async () => {
+    disconnect();
+    setStatus('connecting');
+
+    try {
+      const result = await signaling.createRoom(clientIdRef.current);
+      const message = result.messages.find((item) => item.type === 'roomCreated');
+      if (!message?.code) {
+        throw new Error('Unable to create a room');
+      }
+
+      openConnection('host', message.code, result.cursor ?? 0);
+    } catch (err) {
+      setStatus('error');
+      setError(err instanceof Error ? err.message : 'Room server error');
+    }
+  }, [disconnect, openConnection, signaling]);
 
   const joinRoom = useCallback(
-    (code: string) => {
-      connectWebSocket((socket) => socket.send(JSON.stringify({ type: 'joinRoom', code })));
+    async (code: string) => {
+      disconnect();
+      setStatus('connecting');
+
+      try {
+        const result = await signaling.joinRoom(code, clientIdRef.current);
+        const message = result.messages.find((item) => item.type === 'roomJoined');
+        if (!message?.code) {
+          throw new Error('Unable to join room');
+        }
+
+        openConnection('guest', message.code, result.cursor ?? 0);
+      } catch (err) {
+        setStatus('error');
+        setError(err instanceof Error ? err.message : 'Room server error');
+      }
     },
-    [connectWebSocket],
+    [disconnect, openConnection, signaling],
   );
 
   const copyInvite = useCallback(async () => {
@@ -219,36 +192,50 @@ export function useOnlineRoom(hostGame: BattleGame) {
         return;
       }
 
-      relay({ type: 'guestInput', action });
+      sendChannelMessage({ type: 'guestInput', action });
     },
-    [hostGame.controls, relay],
+    [hostGame.controls, sendChannelMessage],
   );
 
   const start = useCallback(() => {
     hostGame.controls.start();
-    relay({ type: 'hostControl', control: 'start' });
-  }, [hostGame.controls, relay]);
+    sendChannelMessage({ type: 'control', control: 'start' });
+    scheduleSnapshot();
+  }, [hostGame.controls, scheduleSnapshot, sendChannelMessage]);
 
   const pause = useCallback(() => {
     hostGame.controls.pause();
-    relay({ type: 'hostControl', control: 'pause' });
-  }, [hostGame.controls, relay]);
+    sendChannelMessage({ type: 'control', control: 'pause' });
+    scheduleSnapshot();
+  }, [hostGame.controls, scheduleSnapshot, sendChannelMessage]);
 
   const resume = useCallback(() => {
     hostGame.controls.resume();
-    relay({ type: 'hostControl', control: 'resume' });
-  }, [hostGame.controls, relay]);
+    sendChannelMessage({ type: 'control', control: 'resume' });
+    scheduleSnapshot();
+  }, [hostGame.controls, scheduleSnapshot, sendChannelMessage]);
 
   const reset = useCallback(() => {
     hostGame.controls.reset();
-    relay({ type: 'hostControl', control: 'reset' });
-  }, [hostGame.controls, relay]);
+    sendChannelMessage({ type: 'control', control: 'reset' });
+    scheduleSnapshot();
+  }, [hostGame.controls, scheduleSnapshot, sendChannelMessage]);
 
   useEffect(() => {
-    if (role === 'host' && status === 'connected') {
-      relay({ type: 'hostSnapshot', state: hostGame.state });
+    scheduleSnapshot();
+  }, [hostGame.state, scheduleSnapshot]);
+
+  useEffect(() => {
+    if (status !== 'connected') {
+      return undefined;
     }
-  }, [hostGame.state, relay, role, status]);
+
+    const interval = window.setInterval(() => {
+      sendChannelMessage({ type: 'ping', id: crypto.randomUUID(), sentAt: performance.now() });
+    }, PING_MS);
+
+    return () => window.clearInterval(interval);
+  }, [sendChannelMessage, status]);
 
   useEffect(() => () => disconnect(), [disconnect]);
 
@@ -259,6 +246,7 @@ export function useOnlineRoom(hostGame: BattleGame) {
     status,
     error,
     copied,
+    latencyMs,
     visibleState: role === 'guest' ? remoteState : hostGame.state,
     createRoom,
     joinRoom,
