@@ -6,9 +6,11 @@ const rooms = createRoomStore();
 const wss = new WebSocketServer({ port });
 
 function send(client, message) {
-  if (client?.readyState === client?.OPEN) {
-    client.send(JSON.stringify(message));
+  if (!client || client.readyState !== client.OPEN) {
+    return;
   }
+
+  client.send(JSON.stringify(message));
 }
 
 function sendError(client, message) {
