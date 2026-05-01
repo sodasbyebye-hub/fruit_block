@@ -12,6 +12,7 @@ interface GameToolbarProps {
   onResume: () => void;
   onReset: () => void;
   onToggleSettings: () => void;
+  onBackToMenu?: () => void;
 }
 
 export function GameToolbar({
@@ -25,11 +26,14 @@ export function GameToolbar({
   onResume,
   onReset,
   onToggleSettings,
+  onBackToMenu,
 }: GameToolbarProps) {
-  const winnerName = winner === 'p1' ? labels.player1 : labels.player2;
+  const winnerName = winner === 'p1' ? labels.player1 : winner === 'p2' ? labels.player2 : null;
   const headline =
     status === 'finished'
-      ? labels.titleWin(winnerName)
+      ? winnerName
+        ? labels.titleWin(winnerName)
+        : labels.titleGameOver
       : status === 'paused'
         ? labels.titlePaused
         : status === 'playing'
@@ -47,6 +51,11 @@ export function GameToolbar({
       </div>
 
       <div className="toolbar-actions">
+        {onBackToMenu && (
+          <button className="icon-button toolbar-text-button" title={labels.backToMenu} type="button" onClick={onBackToMenu}>
+            {labels.backToMenu}
+          </button>
+        )}
         {canControl && status === 'ready' && (
           <button className="primary-button" type="button" onClick={onStart}>
             {labels.start}
